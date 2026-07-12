@@ -523,6 +523,13 @@ class CentauriClient:
         ack = response.get("Data", {}).get("Ack", 0)
         return ack == 0
     
+    async def enable_camera_stream(self, enable: bool = True) -> dict:
+        """Enable/disable camera video stream (Cmd: 386)."""
+        response = await self._send_request(386, {"Enable": 1 if enable else 0})
+        ack = response.get("Data", {}).get("Ack", 0)
+        video_url = response.get("Data", {}).get("VideoUrl", "") if ack == 0 else ""
+        return {"success": ack == 0, "video_url": video_url}
+    
     async def ping(self) -> bool:
         """Send heartbeat ping."""
         if not self.connected:

@@ -116,8 +116,8 @@ class CentauriMCPServer:
                     description="Adjust cooling fan speeds. Values 0-100% for model fan, auxiliary fan, and box fan.",
                 ),
                 Tool(
-                    name="set_print_speed",
-                    description="Adjust print speed percentage (50-150% of base speed).",
+                    name="get_camera_status",
+                    description="Check camera/CANVAS module status and get video stream URL if available. Returns camera connection state and stream URL.",
                 ),
             ]
         
@@ -448,6 +448,39 @@ class CentauriMCPServer:
             type="text",
             text=f"Print speed set to {speed_pct}%: {success}",
         )]
+    
+    async def _get_camera_status(self) -> list[TextContent]:
+        """Get camera/CANVAS module status."""
+        status = await self.printer.request_status()
+        attrs = await self.printer.request_attributes()
+        
+        s = status.to_safe_dict()
+        
+        result = []
+        result.append("🎨 CANVAS Module Status")
+        result.append("=" * 50)
+        result.append(f"")
+        result.append(f"Camera Connected: {'✅ YES' if s['components']['camera_connected'] else '❌ NO'}")
+        result.append(f"Video Streaming: {'✅ Supported' if 'VIDEO_STREAM' in attrs.capabilities else '❌ Not supported'}")
+        result.append(f"")
+        result.append(f"Printer: {attrs.name}")
+        result.append(f"Firmware: {attrs.firmware_version}")
+        result.append(f"")
+        
+        if s['components']['camera_connected']:
+            result.append(f"📹 Video Stream URL:")
+            result.append(f"   http://{PRINTER_IP}:3031/video")
+            result.append(f"")
+            result.append(f"💡 To view CANVAS colors:")
+            result.append(f"   - Open video stream URL in browser")
+            result.append(f"   - Check printer web interface")
+            result.append(f"   - Colors visible during print jobs")
+        else:
+            result.append(f"")
+            result.append(f"⚠️  Camera not connected.")
+            result.append(f"   Check CANVAS module connection.")
+        
+        return [TextContent(type="text", text="\n".join(result))]
     
     async def run(self) -> None:
         """Run the MCP server."""
