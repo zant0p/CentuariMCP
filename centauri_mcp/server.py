@@ -60,11 +60,40 @@ class CentauriMCPServer:
                 ),
                 Tool(
                     name="list_files",
-                    description="List available print files on the printer's storage. Specify path as '/local/' for internal storage or '/usb/' for USB drive.",
+                    description="List available print files on the printer's storage. Specify path as '/local/' for internal storage or '/usb/' for USB drive. Returns files sorted by name with size info.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Storage path: '/local/' or '/usb/'",
+                                "default": "/local/"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Max files to return (default: all)",
+                                "default": 0
+                            },
+                            "filter": {
+                                "type": "string",
+                                "description": "Filter by filename substring (optional)"
+                            }
+                        }
+                    }
                 ),
                 Tool(
                     name="get_print_history",
-                    description="Get historical print jobs with details like duration, layers, and status.",
+                    description="Get historical print jobs with details like duration, layers, status, and timestamps. Returns most recent jobs first.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Number of recent jobs to return (default: 10)",
+                                "default": 10
+                            }
+                        }
+                    }
                 ),
                 Tool(
                     name="pause_print",
@@ -211,31 +240,104 @@ class CentauriMCPServer:
             }),
         )]
     
-    async def _list_files(self, path: str) -> list[TextContent]:
-        """List files in directory."""
+    async def _list_files(self, args: dict) -> list[TextContent]:
+        """List files in directory with improved formatting."""
+        path = args.get("path", "/local/")
+        limit = args.get("limit", 0)
+        filter_text = args.get("filter", "")
+        
         files = await self.printer.get_file_list(path)
-        return [TextContent(
-            type="text",
-            text=str(files),
-        )]
+        
+        if not files:
+            return [TextContent(type="text", text="No files found")]
+        
+        # Filter if requested
+        if filter_text:
+            files = [f for f in files if filter_text.lower() in f.get("name", "").lower()]
+        
+        # Limit if requested
+        if limit and limit > 0:
+            files = files[:limit]
+        
+        # Format output
+        output = []
+        for i, f in enumerate(files, 1):
+            name = f.get("name", "unknown").replace(path, "")
+            size_bytes = f.get("usedSize", 0)
+            file_type = "📁" if f.get("type") == 0 else "📄"
+            
+            size_str = f"{size_bytes / 1024:.1f} KB" if size_bytes > 0 else "(size unknown)"
+            output.append(f"{i}. {file_type} {name}\n   Size: {size_str}")
+        
+        result = f"📁 Files in {path}:\n"
+        result += "=" * 50 + "\n"
+        result += "\n".join(output)
+        result += f"\n\nTotal: {len(files)} file(s)"
+        
+        return [TextContent(type="text", text=result)]
     
-    async def _get_print_history(self) -> list[TextContent]:
-        """Get print history."""
+    async def _get_print_history(self, args: dict) -> list[TextContent]:
+        """Get print history with timestamps."""
+        limit = args.get("limit", 10)
+        
         # Cmd 320: Get history list
         history_response = await self.printer._send_request(320)
+        ack = history_response.get("Data", {}).get("Ack", -1)
+        
+        if ack != 0:
+            return [TextContent(type="text", text=f"History request failed (ack={ack})")]
+        
         history_ids = history_response.get("Data", {}).get("HistoryData", [])
         
         if not history_ids:
             return [TextContent(type="text", text="No print history found")]
         
-        # Cmd 321: Get details for each job
-        details_response = await self.printer._send_request(321, {"Id": history_ids})
+        # Get details for most recent jobs
+        ids_to_fetch = history_ids[:limit]
+        details_response = await self.printer._send_request(321, {"Id": ids_to_fetch})
         history_details = details_response.get("Data", {}).get("HistoryDetailList", [])
         
-        return [TextContent(
-            type="text",
-            text=str(history_details),
-        )]
+        if not history_details:
+            return [TextContent(type="text", text="Could not retrieve history details")]
+        
+        # Format output
+        from datetime import datetime
+        
+        output = []
+        output.append("📋 Recent Print History")
+        output.append("=" * 60)
+        
+        for i, job in enumerate(history_details, 1):
+            name = job.get("TaskName", "Unknown")
+            begin_time = job.get("BeginTime", 0)
+            end_time = job.get("EndTime", 0)
+            status = job.get("TaskStatus", 0)
+            layers = job.get("AlreadyPrintLayer", 0)
+            error_reason = job.get("ErrorStatusReason", 0)
+            
+            status_str = {0: "Other", 1: "✅ Completed", 2: "⚠️ Exception", 3: "❌ Stopped"}.get(status, f"Unknown({status})")
+            
+            begin_dt = datetime.fromtimestamp(begin_time) if begin_time else None
+            end_dt = datetime.fromtimestamp(end_time) if end_time else None
+            
+            duration_str = ""
+            if begin_dt and end_dt:
+                duration = end_dt - begin_dt
+                hours, remainder = divmod(int(duration.total_seconds()), 3600)
+                minutes, _ = divmod(remainder, 60)
+                duration_str = f" ({hours}h {minutes}m)"
+            
+            output.append(f"\n{i}. {name}")
+            output.append(f"   Status: {status_str}")
+            if begin_dt:
+                output.append(f"   Started: {begin_dt.strftime('%Y-%m-%d %H:%M')}")
+            if end_dt:
+                output.append(f"   Ended: {end_dt.strftime('%Y-%m-%d %H:%M')}{duration_str}")
+            output.append(f"   Layers: {layers}")
+            if error_reason and error_reason != 0:
+                output.append(f"   Error Code: {error_reason}")
+        
+        return [TextContent(type="text", text="\n".join(output))]
     
     async def _pause_print(self) -> list[TextContent]:
         """Pause current print."""
