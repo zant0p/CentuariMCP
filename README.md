@@ -14,6 +14,31 @@ This project provides **controlled access** to 3D printer operations with built-
 
 **Never leave a 3D printer unattended while printing.** This tool assists with monitoring and control but does not replace proper safety practices.
 
+## 🎨 CANVAS Multi-Filament Support (CC1 Limitation)
+
+**Centauri Carbon (CC1) Firmware Limitation:**
+
+The CANVAS CC1 module filament slot configuration (colors, materials per slot) is **not readable via the SDCP protocol** on the original Centauri Carbon (CC1). This is a firmware design decision by Elegoo.
+
+**What works:**
+- ✅ CANVAS module connection detection (`AmsConnectStatus`)
+- ✅ Filament runout/jam monitoring during prints
+- ✅ Starting multi-filament prints (printer uses internal config)
+- ✅ Video stream for visual monitoring
+
+**What doesn't work:**
+- ❌ Reading filament slot colors/materials via API
+- ❌ Verifying which filament is in which slot programmatically
+- ❌ Modifying slot configuration via API
+
+**Workaround:**
+For multi-filament prints, verify slot configuration via:
+- Printer web UI: `http://192.168.1.41/network-device-manager/network/control`
+- Printer touchscreen menu
+- Video stream: `http://192.168.1.41:3031/video` (shows physical spools)
+
+**Note:** Centauri Carbon 2 (CC2) uses a different protocol (MQTT) that DOES expose filament slot data. This limitation applies only to CC1.
+
 ## Features
 
 ### Phase 1: Read-Only Monitoring ✅
