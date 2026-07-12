@@ -99,6 +99,7 @@ class PrinterStatus:
     # Component status
     motors_connected: bool = True
     camera_connected: bool = False
+    ams_connected: bool = False  # CANVAS/AMS module
     
     @classmethod
     def from_status_dict(cls, status: Dict[str, Any]) -> "PrinterStatus":
@@ -146,6 +147,7 @@ class PrinterStatus:
                 devices_status.get("ExtruderMotorStatus", 0) == 1,
             ]),
             camera_connected=status_data.get("CameraStatus", 0) == 1,
+            ams_connected=status_data.get("AmsConnectStatus", 0) == 1,
         )
     
     def to_safe_dict(self) -> Dict[str, Any]:
@@ -180,6 +182,7 @@ class PrinterStatus:
             "components": {
                 "motors_connected": self.motors_connected,
                 "camera_connected": self.camera_connected,
+                "ams_connected": self.ams_connected,  # CANVAS module
             },
         }
 

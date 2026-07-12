@@ -460,25 +460,34 @@ class CentauriMCPServer:
         result.append("🎨 CANVAS Module Status")
         result.append("=" * 50)
         result.append(f"")
-        result.append(f"Camera Connected: {'✅ YES' if s['components']['camera_connected'] else '❌ NO'}")
+        result.append(f"Camera: {'✅ CONNECTED' if s['components']['camera_connected'] else '❌ NOT CONNECTED'}")
+        result.append(f"AMS/CANVAS: {'✅ CONNECTED' if s['components']['ams_connected'] else '❌ NOT CONNECTED'}")
         result.append(f"Video Streaming: {'✅ Supported' if 'VIDEO_STREAM' in attrs.capabilities else '❌ Not supported'}")
         result.append(f"")
         result.append(f"Printer: {attrs.name}")
         result.append(f"Firmware: {attrs.firmware_version}")
         result.append(f"")
         
+        if s['components']['ams_connected']:
+            result.append(f"🎯 CANVAS CC1 Module:")
+            result.append(f"   - 4 filament slots available")
+            result.append(f"   - Auto filament changing enabled")
+            result.append(f"   - Filament runout monitoring active")
+            result.append(f"")
+            result.append(f"💡 Filament Configuration:")
+            result.append(f"   Slot colors/materials set via:")
+            result.append(f"   - Printer web interface: http://{PRINTER_IP}/")
+            result.append(f"   - Printer touchscreen menu")
+            result.append(f"   - Active during print jobs")
+        
         if s['components']['camera_connected']:
+            result.append(f"")
             result.append(f"📹 Video Stream URL:")
             result.append(f"   http://{PRINTER_IP}:3031/video")
+        elif s['components']['ams_connected']:
             result.append(f"")
-            result.append(f"💡 To view CANVAS colors:")
-            result.append(f"   - Open video stream URL in browser")
-            result.append(f"   - Check printer web interface")
-            result.append(f"   - Colors visible during print jobs")
-        else:
-            result.append(f"")
-            result.append(f"⚠️  Camera not connected.")
-            result.append(f"   Check CANVAS module connection.")
+            result.append(f"⚠️  Camera stream can be enabled")
+            result.append(f"   Use enable_camera_stream command")
         
         return [TextContent(type="text", text="\n".join(result))]
     
