@@ -269,8 +269,13 @@ class CentauriClient:
             # Start receive loop
             self._receive_task = asyncio.create_task(self._receive_loop())
             
-            # Request initial status and attributes
+            # Wait a moment for any initial messages
+            await asyncio.sleep(0.1)
+            
+            # Request status and attributes (printer doesn't send automatically)
+            logger.info("Requesting initial status and attributes...")
             await self.request_status()
+            await asyncio.sleep(0.1)
             await self.request_attributes()
             
             logger.info("Connected to Centauri Carbon")
@@ -303,9 +308,6 @@ class CentauriClient:
         try:
             async for message in self._ws:
                 await self._handle_message(message)
-        except websockets.ConnectionClosed:
-            logger.warning("WebSocket connection closed")
-            self._connected = False
         except Exception as e:
             logger.error(f"Receive error: {e}")
             if self._error_callback:
@@ -391,17 +393,68 @@ class CentauriClient:
     
     async def request_status(self) -> PrinterStatus:
         """Request current printer status (Cmd: 0)."""
-        await self._send_request(0)
-        if self._status is None:
-            raise RuntimeError("No status received")
-        return self._status
+        # Send request and wait for status topic (not response)
+        request_id = str(uuid.uuid4())
+        timestamp = int(asyncio.get_event_loop().time())
+        
+        request = {
+            "Id": str(uuid.uuid4()),
+            "Data": {
+                "Cmd": 0,
+                "Data": {},
+                "RequestID": request_id,
+                "MainboardID": self.mainboard_id,
+                "TimeStamp": timestamp,
+                "From": 0,
+            },
+            "Topic": f"sdcp/request/{self.mainboard_id}",
+        }
+        
+        if not self.connected:
+            raise ConnectionError("Not connected to printer")
+        
+        await self._ws.send(json.dumps(request))
+        logger.debug(f"Sent status request: {request_id}")
+        
+        # Wait for status message (not response)
+        for _ in range(10):  # Wait up to 2 seconds
+            await asyncio.sleep(0.2)
+            if self._status is not None:
+                return self._status
+        
+        raise TimeoutError("No status received from printer")
     
     async def request_attributes(self) -> PrinterAttributes:
         """Request printer attributes (Cmd: 1)."""
-        await self._send_request(1)
-        if self._attributes is None:
-            raise RuntimeError("No attributes received")
-        return self._attributes
+        if not self.connected:
+            raise ConnectionError("Not connected to printer")
+        
+        request_id = str(uuid.uuid4())
+        timestamp = int(asyncio.get_event_loop().time())
+        
+        request = {
+            "Id": str(uuid.uuid4()),
+            "Data": {
+                "Cmd": 1,
+                "Data": {},
+                "RequestID": request_id,
+                "MainboardID": self.mainboard_id,
+                "TimeStamp": timestamp,
+                "From": 0,
+            },
+            "Topic": f"sdcp/request/{self.mainboard_id}",
+        }
+        
+        await self._ws.send(json.dumps(request))
+        logger.debug(f"Sent attributes request: {request_id}")
+        
+        # Wait for attributes message
+        for _ in range(10):  # Wait up to 2 seconds
+            await asyncio.sleep(0.2)
+            if self._attributes is not None:
+                return self._attributes
+        
+        raise TimeoutError("No attributes received from printer")
     
     async def get_file_list(self, path: str = "/local/") -> list:
         """Get list of files in directory (Cmd: 258)."""
