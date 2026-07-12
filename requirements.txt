@@ -1,0 +1,11 @@
+# MCP SDK
+mcp>=1.0.0
+
+# WebSocket support
+websockets>=12.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Async support (included with Python 3.10+)
+# asyncio
