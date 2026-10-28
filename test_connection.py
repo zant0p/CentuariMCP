@@ -9,7 +9,7 @@ import uuid
 import websockets
 
 # Configuration from discovery
-PRINTER_IP = os.getenv("PRINTER_IP", "192.168.1.41")
+PRINTER_IP = os.getenv("PRINTER_IP", "192.168.100.114")
 PRINTER_PORT = int(os.getenv("PRINTER_PORT", "3030"))
 MAINBOARD_ID = os.getenv("MAINBOARD_ID", "60461c580103147000001c0000000000")
 WS_PATH = "/websocket"

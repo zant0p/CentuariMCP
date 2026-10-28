@@ -33,9 +33,9 @@ The CANVAS CC1 module filament slot configuration (colors, materials per slot) i
 
 **Workaround:**
 For multi-filament prints, verify slot configuration via:
-- Printer web UI: `http://192.168.1.41/network-device-manager/network/control`
+- Printer web UI: `http://192.168.100.114/network-device-manager/network/control`
 - Printer touchscreen menu
-- Video stream: `http://192.168.1.41:3031/video` (shows physical spools)
+- Video stream: `http://192.168.100.114:3031/video` (shows physical spools)
 
 **Note:** Centauri Carbon 2 (CC2) uses a different protocol (MQTT) that DOES expose filament slot data. This limitation applies only to CC1.
 
@@ -82,9 +82,9 @@ Create a `.env` file with your settings:
 
 ```env
 # Printer Configuration
-PRINTER_IP=192.168.1.41
+PRINTER_IP=192.168.100.114
 PRINTER_PORT=3030
-MAINBOARD_ID=000000000001d354
+MAINBOARD_ID=60461c580103147000001c0000000000
 
 # Safety Limits
 MAX_NOZZLE_TEMP=300
@@ -113,7 +113,7 @@ python -m centauri_mcp.server
       "command": "python",
       "args": ["-m", "centauri_mcp.server"],
       "env": {
-        "PRINTER_IP": "192.168.1.41"
+        "PRINTER_IP": "192.168.100.114"
       }
     }
   }
