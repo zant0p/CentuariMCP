@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Configuration from environment
 PRINTER_IP = os.getenv("PRINTER_IP", "192.168.100.114")
 PRINTER_PORT = int(os.getenv("PRINTER_PORT", "3030"))
-MAINBOARD_ID = os.getenv("MAINBOARD_ID", "")
+MAINBOARD_ID = os.getenv("MAINBOARD_ID", "60461c580103147000001c0000000000")
 MAX_NOZZLE_TEMP = float(os.getenv("MAX_NOZZLE_TEMP", "300"))
 MAX_BED_TEMP = float(os.getenv("MAX_BED_TEMP", "110"))
 
