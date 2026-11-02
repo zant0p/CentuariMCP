@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 import uuid
 import logging
 from typing import Optional, Dict, Any, Callable
@@ -12,12 +13,25 @@ logger = logging.getLogger(__name__)
 
 
 class MachineStatus(IntEnum):
-    """Machine status codes from SDCP protocol."""
+    """Machine status codes (``CurrentStatus``).
+
+    Elegoo's SDK defines more than the public docs list, and the printer does
+    send the undocumented ones - a CC1 was observed reporting 5 (auto levelling)
+    while idle. Values outside this enum must not break parsing, so
+    ``from_status_dict`` falls back to the raw integer.
+    """
     IDLE = 0
     PRINTING = 1
     FILE_TRANSFERRING = 2
-    CALIBRATING = 3
-    DEVICE_TESTING = 4
+    EXPOSURE_TESTING = 3      # resin printers
+    PRINTERS_TESTING = 4      # self-check
+    AUTO_LEVEL = 5
+    RESONANCE_TESTING = 6     # FDM
+    OTHERS_BUSY = 7
+    FILE_CHECKING = 8
+    HOMING = 9
+    FEED_OUT = 10
+    PID_DETECT = 11
 
 
 class PrintStatus(IntEnum):
@@ -33,6 +47,44 @@ class PrintStatus(IntEnum):
     STOPPED = 8
     COMPLETE = 9
     FILE_CHECKING = 10
+    PRINTERS_CHECKING = 11
+    RESUMING = 12
+    PRINTING = 13
+    # Observed on the CC1 while a job is being set up, before any layer is
+    # laid down. The Filename field is EMPTY during these states.
+    PREPARING = 16
+    STARTING = 20
+    AUTO_FEEDING = 23
+    FEEDOUT = 24
+    FEEDOUT_ABNORMAL = 25
+    FEEDOUT_PAUSED = 26
+
+    @classmethod
+    def is_busy(cls, value: int) -> bool:
+        """True if the printer is doing something and must not be disturbed.
+
+        Anything other than a finished job counts as busy - in particular a
+        PAUSED print is still busy, and treating it as idle would let a second
+        print start on top of the paused one.
+        """
+        return value in {
+            cls.HOMING, cls.DROPPING, cls.EXPOSURING, cls.LIFTING,
+            cls.PAUSING, cls.PAUSED, cls.STOPPING, cls.STOPPED,
+            cls.FILE_CHECKING, cls.PRINTERS_CHECKING, cls.RESUMING,
+            cls.PREPARING, cls.STARTING, cls.PRINTING,
+        }
+
+
+class StartPrintAck(IntEnum):
+    """Ack codes returned by cmd 128 (start print)."""
+    OK = 0
+    BUSY = 1
+    NOT_FOUND = 2
+    MD5_FAILED = 3
+    FILEIO_FAILED = 4
+    INVALID_RESOLUTION = 5
+    UNKNOWN_FORMAT = 6
+    UNKNOWN_MODEL = 7
 
 
 class PrintError(IntEnum):
@@ -90,6 +142,8 @@ class PrinterStatus:
     error_number: int = 0
     error_reason: int = 0
     is_error: bool = False
+    # True when the chamber light is on.
+    light_on: bool = False
     
     # Fan speeds (0-100%)
     model_fan: int = 0
@@ -101,6 +155,16 @@ class PrinterStatus:
     camera_connected: bool = False
     ams_connected: bool = False  # CANVAS/AMS module
     
+    @property
+    def is_busy(self) -> bool:
+        """True when the printer is doing something and must not be disturbed.
+
+        Derived from the *print job* state (``PrintInfo.Status``), not from
+        ``CurrentStatus`` - the machine reports "printing" even when it is
+        idle, and vice versa.
+        """
+        return PrintStatus.is_busy(self.print_status)
+
     @classmethod
     def from_status_dict(cls, status: Dict[str, Any]) -> "PrinterStatus":
         """Parse PrinterStatus from SDCP status message."""
@@ -118,9 +182,23 @@ class PrinterStatus:
         error_reason = print_info.get("ErrorStatusReason", 0) if isinstance(print_info, dict) else 0
         is_error = error_num != 0 or error_reason != 0
         
+        light_status = status_data.get("LightStatus", {}) or {}
+
+        raw_machine_status = status_data.get("CurrentStatus", [0])[0]
+        try:
+            machine_status = MachineStatus(raw_machine_status)
+        except ValueError:
+            # Undocumented value - keep the raw integer rather than failing
+            # to parse the whole frame.
+            logger.warning(
+                "Unknown machine status %s; keeping raw value", raw_machine_status
+            )
+            machine_status = raw_machine_status
+
         return cls(
-            machine_status=MachineStatus(status_data.get("CurrentStatus", [0])[0]),
+            machine_status=machine_status,
             print_status=print_info.get("Status", 0),
+            light_on=int(light_status.get("SecondLight", 0) or 0) == 1,
             nozzle_temp=status_data.get("TempOfNozzle", 0.0),
             nozzle_target=status_data.get("TempTargetNozzle", 0.0),
             bed_temp=status_data.get("TempOfHotbed", 0.0),
@@ -154,7 +232,9 @@ class PrinterStatus:
         """Convert to dictionary for MCP tool responses."""
         return {
             "machine_status": self.machine_status.name,
-            "print_status": PrintStatus(self.print_status).name if 0 <= self.print_status <= 10 else "UNKNOWN",
+            "print_status": PrintStatus(self.print_status).name if 0 <= self.print_status <= 26 else "UNKNOWN",
+            "is_busy": self.is_busy,
+            "light_on": self.light_on,
             "nozzle_temp": self.nozzle_temp,
             "nozzle_target": self.nozzle_target,
             "bed_temp": self.bed_temp,
@@ -225,11 +305,14 @@ class CentauriClient:
         port: int = 3030,
         mainboard_id: str = "",
         timeout: float = 30.0,
+        http_port: int = 80,
     ):
         self.host = host
         self.port = port
         self.mainboard_id = mainboard_id
         self.timeout = timeout
+        # The file-upload endpoint is served on the plain HTTP port.
+        self.http_port = http_port
         
         self._ws: Optional[Any] = None
         self._connected = False
@@ -357,15 +440,29 @@ class CentauriClient:
         except Exception as e:
             logger.error(f"Error handling message: {e}")
     
-    async def _send_request(self, cmd: int, data: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Send a command request and wait for response."""
-        if not self.connected:
-            raise ConnectionError("Not connected to printer")
-        
-        request_id = str(uuid.uuid4())
-        timestamp = int(asyncio.get_event_loop().time())
-        
-        request = {
+    def _build_request(
+        self,
+        cmd: int,
+        data: Dict[str, Any] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build an SDCP request envelope.
+
+        Two fields differ by command, and getting them wrong matters:
+
+        * ``From`` identifies the command source (0 = PC, 1 = WEB_PC, ...).
+          Start print (128) uses **1**; everything else uses 0. Elegoo's own
+          client sends 1 for cmd 128.
+        * ``TimeStamp`` is Unix **seconds** for most commands but
+          **milliseconds** for cmd 128.
+        """
+        request_id = request_id or str(uuid.uuid4())
+        is_start_print = cmd == 128
+        timestamp = (
+            int(time.time() * 1000) if is_start_print else int(time.time())
+        )
+
+        return {
             "Id": str(uuid.uuid4()),
             "Data": {
                 "Cmd": cmd,
@@ -373,10 +470,18 @@ class CentauriClient:
                 "RequestID": request_id,
                 "MainboardID": self.mainboard_id,
                 "TimeStamp": timestamp,
-                "From": 0,
+                "From": 1 if is_start_print else 0,
             },
             "Topic": f"sdcp/request/{self.mainboard_id}",
         }
+
+    async def _send_request(self, cmd: int, data: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Send a command request and wait for response."""
+        if not self.connected:
+            raise ConnectionError("Not connected to printer")
+        
+        request_id = str(uuid.uuid4())
+        request = self._build_request(cmd, data, request_id)
         
         # Create future to wait for response
         future = asyncio.get_event_loop().create_future()
@@ -467,14 +572,96 @@ class CentauriClient:
             raise RuntimeError(f"File list failed with ack: {ack}")
         return response.get("Data", {}).get("FileList", [])
     
-    async def start_print(self, filename: str, start_layer: int = 0) -> bool:
-        """Start printing a file (Cmd: 128)."""
-        response = await self._send_request(128, {
+    async def start_print(
+        self,
+        filename: str,
+        start_layer: int = 0,
+        tray_id: Optional[int] = None,
+        canvas_id: int = 0,
+        bed_leveling: bool = False,
+        bed_type: int = 0,
+        timelapse: bool = False,
+    ) -> bool:
+        """Start printing a file (Cmd: 128).
+
+        Parameters
+        ----------
+        filename:
+            The file **as the printer stored it**, i.e. the full path
+            ``/local/<name>``. A bare filename is accepted and expanded.
+        tray_id:
+            Which CANVAS tray feeds the extruder. This is the important one:
+            the gcode only ever names an extruder (``T0``), never a physical
+            spool, so without ``slot_map`` the printer picks a spool itself
+            and ignores the colour you asked for.
+        canvas_id:
+            The CANVAS unit the tray belongs to.
+        bed_leveling:
+            Auto-level the bed before printing.
+        bed_type:
+            0 = textured (PTE) plate, 1 = smooth (PC) plate.
+        timelapse:
+            Record a timelapse.
+
+        Returns
+        -------
+        bool
+            True if the printer accepted the job.
+
+        Notes
+        -----
+        **Send this once.** Cmd 128 is not idempotent: the printer can accept
+        the job, queue it, and then lose the reply (its services restart around
+        a print), and a retry then starts a *second* print of the same file.
+        If you need retry behaviour, verify against the printer's status
+        instead of re-sending - see :meth:`is_printing_file`.
+        """
+        if not filename.startswith("/"):
+            filename = f"/local/{filename}"
+
+        data: Dict[str, Any] = {
             "Filename": filename,
             "StartLayer": start_layer,
-        })
+            "Calibration_switch": 1 if bed_leveling else 0,
+            "PrintPlatformType": bed_type,
+            "Tlp_Switch": 1 if timelapse else 0,
+        }
+
+        if tray_id is not None:
+            data["slot_map"] = [
+                {"t": 0, "tray_id": tray_id, "canvas_id": canvas_id}
+            ]
+
+        response = await self._send_request(128, data)
         ack = response.get("Data", {}).get("Ack", 0)
-        return ack == 0
+        if ack != 0:
+            raise RuntimeError(
+                f"Printer refused to start the print (ack {ack}: "
+                f"{StartPrintAck(ack).name if ack in StartPrintAck._value2member_map_ else 'unknown'})"
+            )
+        return True
+
+    async def is_printing_file(self, filename: str) -> bool:
+        """Is the printer running (or preparing) this file?
+
+        Note that the printer reports an EMPTY ``Filename`` while a job is in
+        the prepare phase (print states 16 and 20), so a filename match alone
+        will miss a print that has in fact just started. This also treats a
+        busy printer in a prepare/start state as running.
+        """
+        status = self.status
+        if status is None:
+            return False
+        if not status.is_busy:
+            return False
+        if filename and status.filename:
+            if filename in status.filename or status.filename.endswith(filename):
+                return True
+        return status.print_status in (
+            PrintStatus.PREPARING,
+            PrintStatus.STARTING,
+            PrintStatus.PRINTING,
+        )
     
     async def pause_print(self) -> bool:
         """Pause current print (Cmd: 129)."""
@@ -494,6 +681,171 @@ class CentauriClient:
         ack = response.get("Data", {}).get("Ack", 0)
         return ack == 0
     
+    async def get_canvas_status(self) -> Dict[str, Any]:
+        """Read the CANVAS multi-material module (Cmd: 324).
+
+        Returns the raw ``canvas_list`` structure. Each tray entry carries
+        ``tray_id``, ``brand``, ``filament_type``, ``filament_name``,
+        ``filament_color`` (hex), ``min_nozzle_temp``, ``max_nozzle_temp`` and
+        ``status``.
+
+        NOTE: ``status != 0`` means a spool is present. Status 1 is "ready";
+        status 2 is also a loaded spool. Treating only ``status == 1`` as
+        present silently drops a loaded spool.
+        """
+        response = await self._send_request(324)
+        ack = response.get("Data", {}).get("Ack", 0)
+        if ack != 0:
+            raise RuntimeError(f"Canvas status failed with ack: {ack}")
+        return response.get("Data", {})
+
+    async def get_trays(self) -> list:
+        """The CANVAS trays, flattened, each with a normalised ``present`` flag."""
+        data = await self.get_canvas_status()
+        trays = []
+        for canvas in data.get("canvas_list", []):
+            if not canvas.get("connected"):
+                continue
+            for tray in canvas.get("tray_list", []):
+                trays.append({
+                    "tray_id": tray.get("tray_id"),
+                    "canvas_id": canvas.get("canvas_id", 0),
+                    "present": tray.get("status", 0) != 0,
+                    "brand": tray.get("brand", ""),
+                    "filament_type": tray.get("filament_type", ""),
+                    "filament_name": tray.get("filament_name", ""),
+                    "filament_color": tray.get("filament_color", ""),
+                    "min_nozzle_temp": tray.get("min_nozzle_temp"),
+                    "max_nozzle_temp": tray.get("max_nozzle_temp"),
+                    "status": tray.get("status"),
+                })
+        return trays
+
+    async def find_tray_by_color(self, color_hex: str) -> Optional[dict]:
+        """Find the loaded CANVAS tray holding a given colour.
+
+        Match on the **colour hex** rather than the filament name: several
+        trays commonly hold the same product (plain "PLA" in grey, green and
+        pink at once), and matching by name picks whichever comes first.
+        """
+        want = (color_hex or "").lower()
+        if not want:
+            return None
+        trays = await self.get_trays()
+        loaded = [t for t in trays if t["present"]]
+        for tray in loaded:
+            if (tray["filament_color"] or "").lower() == want:
+                return tray
+        return None
+
+    async def set_light(self, on: bool) -> bool:
+        """Turn the chamber light on or off (Cmd: 403).
+
+        The printer reports the state back as
+        ``Status.LightStatus.SecondLight`` (0 = off, 1 = on).
+
+        Note that Elegoo's own SDK has the light variant of cmd 403 commented
+        out, and a badly-formed write command can wedge the printer's control
+        stack. Send it deliberately, not in a tight loop.
+        """
+        response = await self._send_request(
+            403, {"LightStatus": {"SecondLight": 1 if on else 0}}
+        )
+        ack = response.get("Data", {}).get("Ack", 0)
+        return ack == 0
+
+    async def delete_files(self, filenames: list) -> list:
+        """Delete files from the printer's storage (Cmd: 259).
+
+        The paths must include the ``/local/`` prefix, otherwise the printer
+        acknowledges with Ack 0 but deletes nothing.
+        """
+        file_list = [
+            f if f.startswith("/") else f"/local/{f}" for f in filenames
+        ]
+        response = await self._send_request(
+            259, {"FileList": file_list, "FolderList": []}
+        )
+        data = response.get("Data", {})
+        ack = data.get("Ack", 0)
+        if ack != 0:
+            raise RuntimeError(f"Delete failed with ack: {ack}")
+        return data.get("ErrData", [])
+
+    async def upload_file(
+        self,
+        local_path: str,
+        remote_name: Optional[str] = None,
+        chunk_size: int = 1024 * 1024,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> str:
+        """Upload a gcode file to the printer's internal storage.
+
+        ``POST /uploadFile/upload`` as multipart/form-data, one 1 MiB chunk per
+        request. 1 MiB is the documented per-chunk maximum; larger chunks are
+        a plausible cause of the printer's upload handler wedging.
+
+        Form fields: ``Check=1``, ``S-File-MD5`` (whole-file md5, sent on
+        every chunk), ``Offset``, ``Uuid`` (one per transfer, shared by all
+        its chunks), ``TotalSize``, and ``File``.
+
+        The uuid must be a bare hex string - ``uuid4().hex``, no dashes.
+        """
+        import hashlib
+        import os
+        import requests
+
+        remote_name = remote_name or os.path.basename(local_path)
+        size = os.path.getsize(local_path)
+        md5 = hashlib.md5()
+        with open(local_path, "rb") as fh:
+            for block in iter(lambda: fh.read(chunk_size), b""):
+                md5.update(block)
+        file_md5 = md5.hexdigest()
+
+        transfer_id = uuid.uuid4().hex
+        url = f"http://{self.host}:{self.http_port}/uploadFile/upload"
+
+        offset = 0
+        with open(local_path, "rb") as fh:
+            while offset < size:
+                chunk = fh.read(chunk_size)
+                if not chunk:
+                    break
+                response = requests.post(
+                    url,
+                    data={
+                        "TotalSize": str(size),
+                        "Uuid": transfer_id,
+                        "Offset": str(offset),
+                        "Check": "1",
+                        "S-File-MD5": file_md5,
+                    },
+                    files={"File": (remote_name, chunk, "application/octet-stream")},
+                    timeout=120,
+                )
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"Upload failed with HTTP {response.status_code}: "
+                        f"{response.text[:200]}"
+                    )
+                try:
+                    result = response.json()
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"Upload returned non-JSON: {response.text[:200]}"
+                    ) from exc
+                if result.get("code") != "000000":
+                    raise RuntimeError(
+                        f"Upload rejected (code {result.get('code')}): "
+                        f"{result.get('messages')}"
+                    )
+                offset += len(chunk)
+                if progress_callback:
+                    progress_callback(offset, size)
+
+        return remote_name
+
     async def set_print_speed(self, speed_pct: int) -> bool:
         """Set print speed percentage (Cmd: 403)."""
         if not 0 <= speed_pct <= 100:

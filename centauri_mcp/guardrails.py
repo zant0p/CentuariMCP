@@ -204,15 +204,27 @@ class SafetyGuard:
         if not motion_check.safe:
             return motion_check
         
-        # Printer must be IDLE
-        if status.machine_status != MachineStatus.IDLE:
+        # The printer must not be busy.
+        #
+        # Deliberately NOT keyed on machine_status: the CC reports
+        # CurrentStatus "printing" (1) even when it is idle, and "idle" (0)
+        # in situations where it is clearly doing something. The print JOB
+        # state (PrintInfo.Status) is the one that is reliable, and it is
+        # checked below.
+        if status.is_busy:
             return SafetyCheckResult(
                 safe=False,
-                message=f"Cannot start: printer is {status.machine_status.name}, not IDLE",
+                message=(
+                    f"Cannot start: printer is busy "
+                    f"(print status {status.print_status})"
+                ),
                 check_type="not_idle",
             )
         
-        # No active print job
+        # No active print job.
+        # Use the print JOB state, and treat anything that is not finished as
+        # busy - including the prepare/start states (16 and 20) that a job
+        # passes through while it is being set up.
         from .printer_client import PrintStatus
         if status.print_status not in [PrintStatus.IDLE.value, PrintStatus.COMPLETE.value]:
             return SafetyCheckResult(

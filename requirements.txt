@@ -1,8 +1,13 @@
 # MCP SDK
-mcp>=1.0.0
+# Pinned to 1.x: the 2.x line dropped the low-level Server.list_tools /
+# Server.call_tool decorators this server is built on.
+mcp>=1.0.0,<2.0.0
 
 # WebSocket support
 websockets>=12.0
+
+# HTTP uploads to the printer
+requests>=2.31.0
 
 # Environment variables
 python-dotenv>=1.0.0
