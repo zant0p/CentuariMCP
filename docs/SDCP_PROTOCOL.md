@@ -44,6 +44,61 @@ Two fields vary by command, and getting them wrong matters:
   `0 = PC`, `1 = WEB_PC`, `2 = WEB`, `3 = APP`, `4 = SERVER`.
   Most commands use `0`; **start print (128) uses `1`** — as does Elegoo's own client.
 - **`TimeStamp`** is Unix seconds for most commands, but **milliseconds for cmd 128**.
+- **`RequestID`** should be a **short** id — 16 hex characters. See §2.1 for why
+  the length matters.
+
+### 2.1 The RequestID echo is not always verbatim
+
+This is the single most expensive quirk in the protocol, so it gets its own
+section.
+
+The printer echoes the `RequestID` back in its reply — but **not always
+unchanged**. When the request's `From` is non-zero, the printer **appends a
+byte equal to that `From` value** to the echoed `RequestID`.
+
+Measured on a live Centauri Carbon:
+
+| From | TimeStamp | RequestID sent | RequestID echoed |
+|------|-----------|----------------|------------------|
+| `1` | ms | 36-char dashed uuid | uuid **+ `0x01`** (37 chars) |
+| `1` | ms | 16-char hex | 16-char hex, clean |
+| `2` | s  | 36-char dashed uuid | uuid **+ `0x02`** |
+| `0` | s  | 36-char dashed uuid | 36-char uuid, clean |
+| `0` | ms | 36-char dashed uuid | 36-char uuid, clean |
+
+A client that correlates replies on **exact equality** silently drops that
+reply, the request never resolves, and the command times out — even though
+the printer answered correctly the whole time.
+
+Cmd 128 is the only command sent with `From: 1`, so it is the only command
+that ever times out. Every other command goes out with `From: 0` and matches
+fine, which is what makes this so confusing to debug: one command in the
+whole protocol misbehaves, and it misbehaves as a timeout rather than as an
+error.
+
+Two defences, and you want both:
+
+1. **Send a short RequestID.** Every reference implementation does:
+   - Elegoo's C++ client (`elegoo-link`): `std::to_string(counter)` → e.g. `"100000"`
+   - Elegoo's web UI: 16 hex chars + `Date.now().toString(16)`
+   - `pycentauri`: `secrets.token_hex(8)` → 16 hex chars
+
+   A short hex id is echoed back byte-for-byte even with a non-zero `From`.
+   (Note that the vendor's own C++ client still does an *exact* match — it
+   dodges the bug by using a numeric id and `From: 0`, not by handling it.)
+
+2. **Correlate tolerantly.** Strip trailing control characters from the
+   echoed `RequestID`, and fall back to a prefix match. This keeps you
+   working even if the printer mangles an echo you did not expect.
+
+Verified against a live printer using a non-existent filename, so no print
+could start: cmd 128 with `From: 1` and a 16-char hex id → `Ack 2`, id echoed
+exactly; cmd 128 with `From: 1` and a dashed uuid → `Ack 2`, id corrupted.
+
+> The printer serves a **single** websocket client at a time. A second
+> connection gets a literal `undefined` back instead of protocol frames, so
+> probe the printer through the client's existing connection rather than
+> opening a parallel one.
 
 ## 3. Response envelope
 
@@ -231,6 +286,13 @@ These are the protocol's own typos and must be sent exactly as written:
 - `Tlp_Switch` — 1 to record a timelapse.
 - `slot_map` — which CANVAS tray feeds which extruder. **Omit it and the printer
   picks a spool itself**, ignoring the colour you asked for. See §8.
+
+> **Cmd 128 and timeouts.** Start print is the one command sent with
+> `From: 1`, and it is therefore the one command whose reply can come back
+> with a mangled `RequestID` (§2.1). If cmd 128 times out while the file
+> is demonstrably on the printer, suspect the correlation, not the file —
+> check that the `RequestID` you send is a short hex id, and that the
+> reply is matched tolerantly.
 
 ### Ack codes for cmd 128
 
@@ -425,3 +487,52 @@ Practical consequences for a client:
 
 That is Elegoo's own sequence (`ElegooLink::loopUpload`: upload, then
 `checkResult`, then `print`), and it is worth copying.
+
+### 12.1 Waiting for the bed
+
+Two separate things must both be true before a print starts, and they are
+not the same thing:
+
+- **The printer is idle** — no print in progress. Check the status flags,
+  and remember that `PREPARING` and `STARTING` count as busy. A print that
+  has *finished* is not busy, but the bed may still hold a part.
+- **The bed is clear** — nothing left over from the previous print.
+
+A completed print does **not** mean the bed is clear. The part is still
+sitting there.
+
+The camera is useful here but must not be trusted on its own: the
+brightness of a frame depends on the **light state**, and the light can be
+off while the bed is empty (or on while a dark part sits on the plate).
+Raw saturation alone will both raise false alarms and miss real ones.
+
+**Fail safe: when the camera cannot tell, ask a human.** The camera
+*advises*; a person confirms. Anything that starts a print on a bed that
+might not be clear risks damaging the nozzle or the part.
+
+### 12.2 Commands that can wedge the printer
+
+The printer's control stack is not forgiving. A malformed or inappropriate
+command can lock up the firmware, and recovery may need a power cycle.
+
+- Stick to the commands this document describes. They are the ones
+  Elegoo's own clients use.
+- Prefer read-only commands (0 status, 1 attributes, 258 file list,
+  324 canvas) when investigating.
+- Do not probe the printer with invented commands to see what happens.
+- Probe a print start against a **non-existent filename** if you need to
+  exercise cmd 128 — the printer answers `Ack 2` (file not found) and no
+  print can begin.
+- The printer serves **one** websocket client at a time. A second
+  connection receives a literal `undefined` rather than protocol frames,
+  which looks like a broken client but is really a busy printer.
+
+### 12.3 Do not queue prints
+
+Prints are started one at a time. Queueing a second print while the bed is
+still occupied leads to the printer refusing the file or the two prints
+fighting over the bed.
+
+Do not start a print merely to test that communication works. Every test
+print is filament, time, and a bed that then needs clearing — and the
+bed-clear check cannot be validated by a print that is already running.

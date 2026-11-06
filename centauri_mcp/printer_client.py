@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import secrets
 import time
 import uuid
 import logging
@@ -10,6 +11,26 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 
 logger = logging.getLogger(__name__)
+
+
+def _new_request_id() -> str:
+    """Return a fresh RequestID for an outgoing command.
+
+    Sixteen hex characters, matching every reference implementation:
+    the vendor's C++ client uses a decimal counter, the vendor's web UI
+    uses 16 hex chars, and pycentauri uses ``secrets.token_hex(8)``.
+
+    A short ID matters: the printer echoes the RequestID back, and for a
+    non-zero "From" it appends a byte to it. The long dashed form of a
+    UUID makes that mangle visible, while a short hex ID is echoed back
+    byte-for-byte.
+    """
+    return secrets.token_hex(8)
+
+
+def _strip_trailing_control(text: str) -> str:
+    """Drop trailing control characters the printer may append to an echo."""
+    return text.rstrip("".join(chr(c) for c in range(0x20)))
 
 
 class MachineStatus(IntEnum):
@@ -422,10 +443,29 @@ class CentauriClient:
                 )
                 
             elif "sdcp/response/" in topic:
-                # Response to our request - match by RequestID
-                request_id = msg_data.get("RequestID", "")
-                if request_id in self._pending_requests:
-                    future = self._pending_requests.pop(request_id)
+                # Response to our request - match by RequestID.
+                #
+                # The printer does not always echo the RequestID back
+                # verbatim. When the request's "From" field is non-zero it
+                # appends a byte equal to that value to the echoed RequestID,
+                # so a reply we cannot match exactly is silently dropped and
+                # the command times out. Cmd 128 (start print) is the only
+                # command sent with From:1, which is exactly why it was the
+                # only command that ever timed out.
+                #
+                # Match on the RequestID with trailing control characters
+                # stripped, and fall back to a prefix match.
+                echoed = _strip_trailing_control(msg_data.get("RequestID", ""))
+                key = None
+                if echoed in self._pending_requests:
+                    key = echoed
+                else:
+                    for candidate in self._pending_requests:
+                        if echoed.startswith(candidate):
+                            key = candidate
+                            break
+                if key is not None:
+                    future = self._pending_requests.pop(key)
                     if not future.done():
                         future.set_result(msg_data)
             
@@ -456,7 +496,7 @@ class CentauriClient:
         * ``TimeStamp`` is Unix **seconds** for most commands but
           **milliseconds** for cmd 128.
         """
-        request_id = request_id or str(uuid.uuid4())
+        request_id = request_id or _new_request_id()
         is_start_print = cmd == 128
         timestamp = (
             int(time.time() * 1000) if is_start_print else int(time.time())
@@ -480,7 +520,7 @@ class CentauriClient:
         if not self.connected:
             raise ConnectionError("Not connected to printer")
         
-        request_id = str(uuid.uuid4())
+        request_id = _new_request_id()
         request = self._build_request(cmd, data, request_id)
         
         # Create future to wait for response
@@ -502,7 +542,7 @@ class CentauriClient:
     async def request_status(self) -> PrinterStatus:
         """Request current printer status (Cmd: 0)."""
         # Send request and wait for status topic (not response)
-        request_id = str(uuid.uuid4())
+        request_id = _new_request_id()
         timestamp = int(asyncio.get_event_loop().time())
         
         request = {
@@ -537,7 +577,7 @@ class CentauriClient:
         if not self.connected:
             raise ConnectionError("Not connected to printer")
         
-        request_id = str(uuid.uuid4())
+        request_id = _new_request_id()
         timestamp = int(asyncio.get_event_loop().time())
         
         request = {
